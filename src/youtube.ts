@@ -232,8 +232,8 @@ export class YouTubeTranscriptFetcher {
 
       // Debug log for development
       if (process.env.NODE_ENV === 'development') {
-        console.debug('YouTube response length:', html.length);
-        console.debug('Contains captions:', html.includes('"captions":'));
+        console.warn('YouTube response length:', html.length);
+        console.warn('Contains captions:', html.includes('"captions":'));
       }
 
       const splittedHTML = html.split('"captions":');
@@ -274,10 +274,11 @@ export class YouTubeTranscriptFetcher {
         }
 
         const tracks = transcripts.captionTracks as { languageCode: string; baseUrl: string }[];
+        const availableLanguages = tracks.map((track) => track.languageCode).join(', ');
+        console.error(`[transcripts] video=${videoId} availableLangs=[${availableLanguages}] requested=${lang ?? 'default'}`);
         if (lang && !tracks.some((track) => track.languageCode === lang)) {
-          const availableLangs = tracks.map((track) => track.languageCode);
           throw new YouTubeTranscriptError(
-            `Language ${lang} not available for video ${videoId}. Available languages: ${availableLangs.join(', ')}`
+            `Language ${lang} not available for video ${videoId}. Available languages: ${availableLanguages}`
           );
         }
 
@@ -288,6 +289,14 @@ export class YouTubeTranscriptFetcher {
         if (!selectedTrack) {
           throw new YouTubeTranscriptError(`Could not find transcript track for video ${videoId}`);
         }
+
+        let selectedFmt = 'auto';
+        try {
+          selectedFmt = new URL(selectedTrack.baseUrl).searchParams.get('fmt') ?? 'auto';
+        } catch {
+          selectedFmt = 'unknown';
+        }
+        console.error(`[transcripts] video=${videoId} selectedTrack=${selectedTrack.languageCode} fmt=${selectedFmt}`);
 
         // Fetch transcript content
         const transcriptResponse = await this.fetchTranscriptContent(selectedTrack, lang);
@@ -329,41 +338,71 @@ export class YouTubeTranscriptFetcher {
       'Origin': 'https://www.youtube.com'
     };
 
-    try {
-      const response = await this.fetchWithRetry(track.baseUrl, { headers });
-      const xml = await response.text();
-      const results: Transcript[] = [];
-      
-      // Use regex to parse XML
-      const regex = /<text start="([^"]+)" dur="([^"]+)"[^>]*>([^<]*)<\/text>/g;
-      let match;
-      
-      while ((match = regex.exec(xml)) !== null) {
-        const start = parseFloat(match[1]);
-        const duration = parseFloat(match[2]);
-        const text = YouTubeUtils.decodeHTML(match[3]);
-        
-        if (text.trim()) {
-          results.push({
-            text: text.trim(),
-            lang: track.languageCode,
-            timestamp: start,
-            duration: duration
-          });
-        }
-      }
+    const candidates = this.buildTranscriptUrlCandidates(track.baseUrl);
+    console.error(`[transcripts] track=${track.languageCode} candidates=${candidates.map((candidate) => candidate.fmt).join(' -> ')}`);
 
-      return {
-        baseUrl: track.baseUrl,
-        languageCode: track.languageCode,
-        transcripts: results.sort((a, b) => a.timestamp - b.timestamp)
-      };
-    } catch (error) {
+    let lastSnippet = '';
+    let lastError: Error | undefined;
+
+    for (const candidate of candidates) {
+      try {
+        const fmtLabel = candidate.fmt;
+        const response = await this.fetchWithRetry(candidate.url, { headers });
+        const body = await response.text();
+        const trimmedPayload = body.trim();
+        const jsonPayload = trimmedPayload.startsWith(")]}'")
+          ? trimmedPayload.slice(4)
+          : trimmedPayload;
+
+        console.error(`[transcripts] attempt lang=${track.languageCode} fmt=${fmtLabel} payloadLength=${trimmedPayload.length}`);
+
+        if (!trimmedPayload) {
+          continue;
+        }
+
+        lastSnippet = trimmedPayload.slice(0, 200);
+
+        if (jsonPayload.startsWith('{') || jsonPayload.startsWith('[')) {
+          console.error(`[transcripts] track=${track.languageCode} fmt=${fmtLabel} payloadType=json`);
+          const transcripts = this.parseJsonTranscriptPayload(jsonPayload, track.languageCode);
+          console.error(`[transcripts] track=${track.languageCode} fmt=${fmtLabel} jsonSegments=${transcripts.length}`);
+          if (transcripts.length > 0) {
+            return {
+              baseUrl: candidate.url,
+              languageCode: track.languageCode,
+              transcripts
+            };
+          }
+          continue;
+        }
+
+        const transcripts = this.parseXmlTranscriptPayload(trimmedPayload, track.languageCode);
+        console.error(`[transcripts] track=${track.languageCode} fmt=${fmtLabel} xmlSegments=${transcripts.length}`);
+        if (transcripts.length > 0) {
+          return {
+            baseUrl: candidate.url,
+            languageCode: track.languageCode,
+            transcripts
+          };
+        }
+      } catch (attemptError) {
+        lastError = attemptError as Error;
+        console.error(`[transcripts] track=${track.languageCode} attemptError=${(attemptError as Error).message}`);
+      }
+    }
+
+    const fmtTried = candidates.map((candidate) => candidate.fmt).join(', ');
+    const snippetInfo = lastSnippet ? ` payloadSnippet=${lastSnippet}` : '';
+
+    if (lastError) {
       throw new YouTubeTranscriptError(
-        `Failed to fetch transcript content: ${(error as Error).message}\n` +
-        'This might be due to network issues or YouTube rate limiting.'
+        `Failed to fetch transcript content after trying fmts=[${fmtTried}]: ${(lastError as Error).message}${snippetInfo ? `\n${snippetInfo}` : ''}`
       );
     }
+
+    throw new YouTubeTranscriptError(
+      `No transcripts found for track ${track.languageCode} after trying fmts=[${fmtTried}]${snippetInfo}`
+    );
   }
 
   /**
@@ -432,6 +471,132 @@ export class YouTubeTranscriptFetcher {
         throw error;
       }
       throw new YouTubeTranscriptError(`Failed to fetch transcripts: ${(error as Error).message}`);
+    }
+  }
+
+  /**
+   * Parse JSON transcript payloads (fmt=json3)
+   */
+  private static parseJsonTranscriptPayload(payload: string, languageCode: string): Transcript[] {
+    try {
+      const data = JSON.parse(payload);
+      const events = Array.isArray(data?.events) ? data.events : [];
+      console.error(`[transcripts] parseJson events=${events.length}`);
+      const transcripts: Transcript[] = [];
+
+      for (const event of events) {
+        const startMsValue = Number(event?.tStartMs ?? 0);
+        const durationMsValue = Number(event?.dDurationMs ?? event?.tDurationMs ?? 0);
+        const segs = Array.isArray(event?.segs) ? event.segs : [];
+        const textFromSegs = segs.map((segment: any) => typeof segment?.utf8 === 'string' ? segment.utf8 : '').join('');
+        const fallbackText = typeof event?.utf8 === 'string' ? event.utf8 : '';
+        const rawText = textFromSegs || fallbackText;
+
+        if (!rawText.trim()) {
+          continue;
+        }
+
+        transcripts.push({
+          text: YouTubeUtils.decodeHTML(rawText.trim()),
+          lang: languageCode,
+          timestamp: Number.isFinite(startMsValue) ? startMsValue / 1000 : 0,
+          duration: Number.isFinite(durationMsValue) ? durationMsValue / 1000 : 0
+        });
+      }
+
+      return transcripts.sort((a, b) => a.timestamp - b.timestamp);
+    } catch (error) {
+      console.error('[transcripts] failedJsonParse payloadSnippet=', payload.slice(0, 200));
+      throw new YouTubeTranscriptError(`Failed to parse JSON transcript payload: ${(error as Error).message}`);
+    }
+  }
+
+  /**
+   * Parse XML transcript payloads
+   */
+  private static parseXmlTranscriptPayload(payload: string, languageCode: string): Transcript[] {
+    const results: Transcript[] = [];
+    const regex = /<text start="([^"]+)" dur="([^"]+)"[^>]*>([^<]*)<\/text>/g;
+    let match: RegExpExecArray | null;
+
+    while ((match = regex.exec(payload)) !== null) {
+      const start = parseFloat(match[1]);
+      const duration = parseFloat(match[2]);
+      const text = YouTubeUtils.decodeHTML(match[3]);
+
+      if (!text.trim()) {
+        continue;
+      }
+
+      results.push({
+        text: text.trim(),
+        lang: languageCode,
+        timestamp: Number.isFinite(start) ? start : 0,
+        duration: Number.isFinite(duration) ? duration : 0
+      });
+    }
+
+    return results.sort((a, b) => a.timestamp - b.timestamp);
+  }
+
+  private static buildTranscriptUrlCandidates(baseUrl: string): { url: string; fmt: string }[] {
+    const candidates: { url: string; fmt: string }[] = [];
+    const seen = new Set<string>();
+
+    const pushCandidate = (url: string, fmt: string) => {
+      const normalizedUrl = url.trim();
+      if (!normalizedUrl || seen.has(normalizedUrl)) {
+        return;
+      }
+      seen.add(normalizedUrl);
+      candidates.push({ url: normalizedUrl, fmt });
+    };
+
+    const baseFmt = this.extractFmtFromUrl(baseUrl) ?? 'auto';
+    pushCandidate(baseUrl, baseFmt);
+
+    const fallbackFmts: string[] = [];
+    const ensureFmt = (fmt: string) => {
+      if (!fallbackFmts.includes(fmt)) {
+        fallbackFmts.push(fmt);
+      }
+    };
+
+    ensureFmt('srv3');
+    ensureFmt('json3');
+    ensureFmt('srv1');
+
+    for (const fmt of fallbackFmts) {
+      if (fmt === baseFmt) {
+        continue;
+      }
+      pushCandidate(this.updateUrlFmt(baseUrl, fmt), fmt);
+    }
+
+    return candidates;
+  }
+
+  private static extractFmtFromUrl(urlStr: string): string | undefined {
+    try {
+      const fmt = new URL(urlStr).searchParams.get('fmt');
+      return fmt ?? undefined;
+    } catch {
+      const match = urlStr.match(/[?&]fmt=([^&]+)/);
+      return match ? match[1] : undefined;
+    }
+  }
+
+  private static updateUrlFmt(urlStr: string, fmt: string): string {
+    try {
+      const url = new URL(urlStr);
+      url.searchParams.set('fmt', fmt);
+      return url.toString();
+    } catch {
+      if (/[?&]fmt=/i.test(urlStr)) {
+        return urlStr.replace(/([?&]fmt=)[^&]*/i, `$1${fmt}`);
+      }
+      const separator = urlStr.includes('?') ? '&' : '?';
+      return `${urlStr}${separator}fmt=${fmt}`;
     }
   }
 } 
